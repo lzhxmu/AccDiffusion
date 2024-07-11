@@ -1,0 +1,11 @@
+*.pyc
+/__pycache__/
+/output/
+output
+/visualization/
+/prompts/
+accdiffusion_sd.py
+sd.sh
+sd2.1.sh
+sdxl.sh
+sdxl2.sh
