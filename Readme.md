@@ -2,6 +2,7 @@
 Code release for "AccDiffusion: An Accurate Method for Higher-Resolution Image Generation" 
 
 
+
 ## Experiments environment
 ### Set up the dependencies as:
 ```
