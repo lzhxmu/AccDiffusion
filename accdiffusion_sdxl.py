@@ -753,6 +753,43 @@ class AccDiffusionSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoade
         self._remove_text_encoder_monkey_patch_classmethod(self.text_encoder)
         self._remove_text_encoder_monkey_patch_classmethod(self.text_encoder_2)
 
+    def tiled_decode(self, latents, current_height, current_width):
+        sample_size = self.unet.config.sample_size
+        core_size = self.unet.config.sample_size // 4
+        core_stride = core_size
+        pad_size = self.unet.config.sample_size // 8 * 3
+        decoder_view_batch_size = 1
+        
+        if self.lowvram:
+            core_stride = core_size // 2
+            pad_size = core_size
+
+        views = self.get_views(current_height, current_width, stride=core_stride, window_size=core_size)
+        views_batch = [views[i : i + decoder_view_batch_size] for i in range(0, len(views), decoder_view_batch_size)]
+        latents_ = F.pad(latents, (pad_size, pad_size, pad_size, pad_size), 'constant', 0)
+        image = torch.zeros(latents.size(0), 3, current_height, current_width).to(latents.device)
+        count = torch.zeros_like(image).to(latents.device)
+        # get the latents corresponding to the current view coordinates
+        with self.progress_bar(total=len(views_batch)) as progress_bar:
+            for j, batch_view in enumerate(views_batch):
+                vb_size = len(batch_view)
+                latents_for_view = torch.cat(
+                    [
+                        latents_[:, :, h_start:h_end+pad_size*2, w_start:w_end+pad_size*2]
+                        for h_start, h_end, w_start, w_end in batch_view
+                    ]
+                ).to(self.vae.device)
+                image_patch = self.vae.decode(latents_for_view / self.vae.config.scaling_factor, return_dict=False)[0]
+                h_start, h_end, w_start, w_end = views[j]
+                h_start, h_end, w_start, w_end = h_start * self.vae_scale_factor, h_end * self.vae_scale_factor, w_start * self.vae_scale_factor, w_end * self.vae_scale_factor
+                p_h_start, p_h_end, p_w_start, p_w_end = pad_size * self.vae_scale_factor, image_patch.size(2) - pad_size * self.vae_scale_factor, pad_size * self.vae_scale_factor, image_patch.size(3) - pad_size * self.vae_scale_factor
+                image[:, :, h_start:h_end, w_start:w_end] += image_patch[:, :, p_h_start:p_h_end, p_w_start:p_w_end].to(latents.device)
+                count[:, :, h_start:h_end, w_start:w_end] += 1
+                progress_bar.update()
+        image = image / count
+        
+        return image
+
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -1283,6 +1320,9 @@ class AccDiffusionSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoade
                     if use_multidiffusion:
                         ############################################# MultiDiffusion #############################################
                         if use_md_prompt:
+                            if self.lowvram:
+                                self.text_encoder.to(device)
+                                self.text_encoder_2.to(device)
                             md_prompt_embeds_list = []
                             md_add_text_embeds_list = []
                             for md_prompt in md_prompts[current_scale_num]:
@@ -1308,6 +1348,9 @@ class AccDiffusionSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoade
                                 md_prompt_embeds_list.append(torch.cat([md_negative_prompt_embeds, md_prompt_embeds], dim=0).to(device))
                                 md_add_text_embeds_list.append(torch.cat([md_negative_pooled_prompt_embeds, md_pooled_prompt_embeds], dim=0).to(device))
                                 del md_negative_prompt_embeds, md_negative_pooled_prompt_embeds
+                            if self.lowvram:
+                                self.text_encoder.cpu()
+                                self.text_encoder_2.cpu()
 
                         if use_md_prompt:
                             random_jitter = True
@@ -1558,12 +1601,15 @@ class AccDiffusionSDXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoade
                         latents = latents.to(next(iter(self.vae.post_quant_conv.parameters())).dtype)
 
                     print("### Phase {} Decoding ###".format(current_scale_num))
-                    if current_height > 2048 or current_width > 2048:
-                        # image = self.tiled_decode(latents, current_height, current_width)
-                        self.enable_vae_tiling()
-                        image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                    if self.lowvram:
+                        image = self.tiled_decode(latents, current_height, current_width)
                     else:
-                        image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                        if current_height > 2048 or current_width > 2048:
+                            # image = self.tiled_decode(latents, current_height, current_width)
+                            self.enable_vae_tiling()
+                            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                        else:
+                            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
 
                     image = self.image_processor.postprocess(image, output_type=output_type)
                     image[0].save(f'{result_path}/AccDiffusion_{current_scale_num}.png')
@@ -1609,6 +1655,7 @@ if __name__ == "__main__":
     parser.add_argument('--view_batch_size', default=16, type=int, help="view_batch_size")
     parser.add_argument('--stride', default=64, type=int, help="stride")
     parser.add_argument('--c', default=0.3, type=float, help="threshold")
+    parser.add_argument('--lowram', default=False, action='store_true', help="low memory mode")
     ## others ##
     parser.add_argument('--debug', default=False, action='store_true')
     parser.add_argument('--experiment_name', default="AccDiffusion")
@@ -1649,7 +1696,7 @@ if __name__ == "__main__":
                     use_skip_residual=args.use_skip_residual, use_progressive_upscaling=args.use_progressive_upscaling,
                     use_dilated_sampling=args.use_dilated_sampling,
                     shuffle=args.shuffle, result_path=f"./output/{args.experiment_name}/{prompt}/{width}_{height}_{seed}/", 
-                    debug=args.debug, save_attention_map=args.save_attention_map, use_md_prompt=args.use_md_prompt, c=args.c
+                    debug=args.debug, save_attention_map=args.save_attention_map, use_md_prompt=args.use_md_prompt, c=args.c, lowvram=args.lowram
                     )
 
 
