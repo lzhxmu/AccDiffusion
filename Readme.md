@@ -5,6 +5,7 @@
 Code release for ["AccDiffusion: An Accurate Method for Higher-Resolution Image Generation"](https://lzhxmu.github.io/accdiffusion/accdiffusion.html) 
 
 ## News
+- **2024.11.19**: 🔥 [AccDiffusion v2](https://github.com/lzhxmu/AccDiffusion_v2) is available!
 - **2024.07.18**: 🔥 AccDiffusion has been accepted to ECCV'24!
 
 ## Experiments environment
